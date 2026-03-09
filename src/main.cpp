@@ -22,6 +22,9 @@ constexpr int kArenaRight = kScreenW - 4;
 constexpr int kPaddleY = 120;
 constexpr uint32_t kTitleScreenMs = 5000;
 constexpr uint32_t kScoreScreenMs = 4000;
+constexpr uint32_t kKonamiFirstRevealMs = 4000;
+constexpr uint32_t kKonamiSecondRevealMs = 6000;
+constexpr uint32_t kGyroOffScreenMs = 2200;
 constexpr uint8_t kSfxVirtualChannel = 0;
 constexpr uint8_t kMp3VirtualChannel = 1;
 
@@ -37,7 +40,16 @@ constexpr size_t kFireBufferSize = (kScreenW * (kScreenH + 2)) + 2;
 constexpr size_t kScoreCount = 5;
 constexpr size_t kOptionCount = 14;
 constexpr size_t kBackgroundCount = 12;
+constexpr size_t kKonamiCodeLength = 11;
+constexpr float kGyroTurnSign = -1.0f;
 constexpr char kNameCharset[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ";
+constexpr float kGyroSensitivityBoost = 1.30f;
+constexpr float kGyroTurnDeadzone = 35.0f;
+constexpr float kGyroTurnFullScale = 140.0f;
+constexpr float kGyroAccelerationStrength = 0.85f;
+constexpr float kMotionLaunchThreshold = 0.42f;
+constexpr float kMotionFilterBlend = 0.18f;
+constexpr uint32_t kMotionLaunchCooldownMs = 350;
 
 constexpr char kDataDir[] = "/ADVnoid";
 constexpr char kConfigFile[] = "/ADVnoid/config.txt";
@@ -54,6 +66,18 @@ enum class GameState : uint8_t {
   LevelClear,
   NameEntry,
   GameOver,
+  KonamiReveal,
+  GyroOff,
+};
+
+enum class KonamiToken : uint8_t {
+  Up,
+  Down,
+  Left,
+  Right,
+  B,
+  A,
+  Enter,
 };
 
 enum class PowerType : uint8_t {
@@ -183,7 +207,12 @@ struct InputState {
   bool helpPressed = false;
   bool menuPrevPressed = false;
   bool menuNextPressed = false;
+  bool upPressed = false;
+  bool downPressed = false;
+  bool konamiBPressed = false;
   char typedChar = 0;
+  float motionTurn = 0.0f;
+  bool motionActionPressed = false;
 };
 
 struct ToneEvent {
@@ -254,6 +283,11 @@ std::array<char, 3> nameEntryChars = {'A', 'A', 'A'};
 std::vector<String> availableTracks;
 std::vector<String> playlistDraft;
 int playlistCursor = 0;
+uint8_t konamiProgress = 0;
+bool gyroControlsEnabled = false;
+float filteredGyroZ = 0.0f;
+float filteredAccelMagnitude = 1.0f;
+uint32_t motionLaunchCooldownUntilMs = 0;
 
 extern const uint8_t title_png_start[] asm("_binary_Gemini_240x128_png_start");
 extern const uint8_t title_png_end[] asm("_binary_Gemini_240x128_png_end");
@@ -281,6 +315,10 @@ extern const uint8_t bg_11_png_start[] asm("_binary_sfondi_240_11_png_start");
 extern const uint8_t bg_11_png_end[] asm("_binary_sfondi_240_11_png_end");
 extern const uint8_t bg_12_png_start[] asm("_binary_sfondi_240_12_png_start");
 extern const uint8_t bg_12_png_end[] asm("_binary_sfondi_240_12_png_end");
+extern const uint8_t konami_1_jpg_start[] asm("_binary_sfondi_240_konami1_jpg_start");
+extern const uint8_t konami_1_jpg_end[] asm("_binary_sfondi_240_konami1_jpg_end");
+extern const uint8_t konami_2_jpg_start[] asm("_binary_sfondi_240_konami2_jpg_start");
+extern const uint8_t konami_2_jpg_end[] asm("_binary_sfondi_240_konami2_jpg_end");
 
 const std::array<BackgroundAsset, kBackgroundCount> kBackgroundAssets = {{
     {bg_1_png_start, bg_1_png_end, "1.PNG", ImageFormat::Png},
@@ -295,6 +333,12 @@ const std::array<BackgroundAsset, kBackgroundCount> kBackgroundAssets = {{
     {bg_10_jpg_start, bg_10_jpg_end, "10.JPG", ImageFormat::Jpg},
     {bg_11_png_start, bg_11_png_end, "11.PNG", ImageFormat::Png},
     {bg_12_png_start, bg_12_png_end, "12.PNG", ImageFormat::Png},
+}};
+
+const std::array<KonamiToken, kKonamiCodeLength> kKonamiCode = {{
+    KonamiToken::Up,    KonamiToken::Up,   KonamiToken::Down, KonamiToken::Down,
+    KonamiToken::Left,  KonamiToken::Right, KonamiToken::Left, KonamiToken::Right,
+    KonamiToken::B,     KonamiToken::A,    KonamiToken::Enter,
 }};
 
 float clampf(const float value, const float low, const float high) {
@@ -480,6 +524,21 @@ char displayNameChar(const char c) {
 
 size_t titlePngSize() {
   return static_cast<size_t>(title_png_end - title_png_start);
+}
+
+size_t binaryAssetSize(const uint8_t* start, const uint8_t* end) {
+  return static_cast<size_t>(end - start);
+}
+
+void resetGyroMotionState() {
+  filteredGyroZ = 0.0f;
+  filteredAccelMagnitude = 1.0f;
+  motionLaunchCooldownUntilMs = 0;
+}
+
+void setGyroControlsEnabled(const bool enabled) {
+  gyroControlsEnabled = enabled;
+  resetGyroMotionState();
 }
 
 uint8_t clampBackgroundIndex(const int index) {
@@ -690,6 +749,132 @@ void sfxStart() {
   queueTone(1800, 18, 4);
   queueTone(2600, 18, 4);
   queueTone(3400, 28, 12);
+}
+
+void sfxKonamiUnlock() {
+  queueTone(1320, 70, 10);
+  queueTone(1760, 70, 10);
+  queueTone(2200, 80, 12);
+  queueTone(2640, 80, 12);
+  queueTone(3520, 120, 18);
+}
+
+void sfxKonamiDisable() {
+  queueTone(1800, 44, 8);
+  queueTone(1320, 56, 8);
+  queueTone(900, 72, 16);
+}
+
+void resetKonamiProgress() {
+  konamiProgress = 0;
+}
+
+bool nextKonamiToken(const InputState& input, KonamiToken& token) {
+  if (input.upPressed) {
+    token = KonamiToken::Up;
+    return true;
+  }
+  if (input.downPressed) {
+    token = KonamiToken::Down;
+    return true;
+  }
+  if (input.leftPressed) {
+    token = KonamiToken::Left;
+    return true;
+  }
+  if (input.rightPressed) {
+    token = KonamiToken::Right;
+    return true;
+  }
+  if (input.konamiBPressed) {
+    token = KonamiToken::B;
+    return true;
+  }
+  if (input.actionPressed) {
+    token = KonamiToken::A;
+    return true;
+  }
+  if (input.pausePressed) {
+    token = KonamiToken::Enter;
+    return true;
+  }
+  return false;
+}
+
+void updateMotionInput(InputState& input) {
+  if (!gyroControlsEnabled || !M5.Imu.isEnabled()) {
+    return;
+  }
+
+  float ax = 0.0f;
+  float ay = 0.0f;
+  float az = 0.0f;
+  float gx = 0.0f;
+  float gy = 0.0f;
+  float gz = 0.0f;
+  M5.Imu.getAccel(&ax, &ay, &az);
+  M5.Imu.getGyro(&gx, &gy, &gz);
+
+  filteredGyroZ = lerpf(filteredGyroZ, gz * kGyroTurnSign, 0.28f);
+  const float gyroAbs = std::fabs(filteredGyroZ);
+  if (gyroAbs > kGyroTurnDeadzone) {
+    const float scaled =
+        clampf((gyroAbs - kGyroTurnDeadzone) / (kGyroTurnFullScale - kGyroTurnDeadzone), 0.0f, 1.0f);
+    const float accelerated = clampf(
+        scaled + (scaled * scaled * kGyroAccelerationStrength), 0.0f, 1.0f);
+    input.motionTurn = clampf((filteredGyroZ > 0.0f ? 1.0f : -1.0f) * accelerated *
+                                  kGyroSensitivityBoost,
+                              -1.0f, 1.0f);
+  }
+
+  const float accelMagnitude = std::sqrt(ax * ax + ay * ay + az * az);
+  filteredAccelMagnitude =
+      lerpf(filteredAccelMagnitude, accelMagnitude, kMotionFilterBlend);
+  const float accelImpulse = accelMagnitude - filteredAccelMagnitude;
+  const uint32_t now = millis();
+  if (accelImpulse > kMotionLaunchThreshold && now >= motionLaunchCooldownUntilMs) {
+    input.motionActionPressed = true;
+    motionLaunchCooldownUntilMs = now + kMotionLaunchCooldownMs;
+  }
+}
+
+void beginKonamiReveal() {
+  resetKonamiProgress();
+  gameState = GameState::KonamiReveal;
+  stateTimerMs = millis();
+  sfxKonamiUnlock();
+}
+
+void beginGyroOffScreen() {
+  resetKonamiProgress();
+  gameState = GameState::GyroOff;
+  stateTimerMs = millis();
+  sfxKonamiDisable();
+}
+
+bool handleKonamiCodeOnTitle(const InputState& input) {
+  KonamiToken token{};
+  if (!nextKonamiToken(input, token)) {
+    return false;
+  }
+
+  const bool hadProgress = konamiProgress != 0;
+  if (token == kKonamiCode[konamiProgress]) {
+    ++konamiProgress;
+    if (konamiProgress >= kKonamiCode.size()) {
+      resetKonamiProgress();
+      if (gyroControlsEnabled) {
+        setGyroControlsEnabled(false);
+        beginGyroOffScreen();
+      } else {
+        beginKonamiReveal();
+      }
+    }
+    return true;
+  }
+
+  konamiProgress = (token == kKonamiCode[0]) ? 1 : 0;
+  return hadProgress || konamiProgress != 0;
 }
 
 void sanitizeBindings();
@@ -1300,6 +1485,7 @@ void newGame() {
   pendingHighScoreIndex = -1;
   nameEntryIndex = 0;
   nameEntryChars = {'A', 'A', 'A'};
+  resetKonamiProgress();
   generateLevel();
   gameState = GameState::Playing;
   stateTimerMs = millis();
@@ -1312,6 +1498,7 @@ void newGame() {
 void returnToTitle() {
   clearEntities();
   resetBallsOnPaddle();
+  resetKonamiProgress();
   gameState = GameState::Title;
   stateTimerMs = millis();
   syncAudioPlayback();
@@ -1808,12 +1995,33 @@ void updateTitle(const InputState& input) {
   if (millis() - stateTimerMs >= (kTitleScreenMs + kScoreScreenMs)) {
     stateTimerMs = millis();
   }
+  if (handleKonamiCodeOnTitle(input)) {
+    return;
+  }
   if (input.actionPressed) {
     newGame();
   } else if (input.optionsPressed) {
+    resetKonamiProgress();
     openOptions(GameState::Title);
   } else if (input.helpPressed) {
+    resetKonamiProgress();
     openHelp(GameState::Title);
+  }
+}
+
+void updateKonamiReveal() {
+  const uint32_t elapsed = millis() - stateTimerMs;
+  if (elapsed >= (kKonamiFirstRevealMs + kKonamiSecondRevealMs)) {
+    setGyroControlsEnabled(true);
+    gameState = GameState::Title;
+    stateTimerMs = millis();
+  }
+}
+
+void updateGyroOff() {
+  if (millis() - stateTimerMs >= kGyroOffScreenMs) {
+    gameState = GameState::Title;
+    stateTimerMs = millis();
   }
 }
 
@@ -1944,7 +2152,8 @@ void updatePlaying(const float dt, const InputState& input) {
   }
 
   paddle.w = currentPaddleWidth();
-  const float direction = (input.right ? 1.0f : 0.0f) - (input.left ? 1.0f : 0.0f);
+  const float keyboardDirection = (input.right ? 1.0f : 0.0f) - (input.left ? 1.0f : 0.0f);
+  const float direction = clampf(keyboardDirection + input.motionTurn, -1.0f, 1.0f);
   paddle.x += direction * currentPaddleSpeed() * dt;
   paddle.x = clampf(paddle.x, kArenaLeft + 2.0f, kArenaRight - paddle.w - 2.0f);
 
@@ -1955,11 +2164,12 @@ void updatePlaying(const float dt, const InputState& input) {
     updateBall(balls[i], dt, static_cast<int>(i) == trailIndex);
   }
 
-  if (input.actionPressed && firstStuckBall() != nullptr) {
+  const bool firePressed = input.actionPressed || input.motionActionPressed;
+  if (firePressed && firstStuckBall() != nullptr) {
     launchBall();
   }
 
-  if (millis() < laserUntilMs && input.actionPressed && hasLaunchedBall()) {
+  if (millis() < laserUntilMs && firePressed && hasLaunchedBall()) {
     fireLaser();
   }
 
@@ -2116,6 +2326,9 @@ InputState readInput() {
   const bool pause = keyboard.isKeyPressed('b') || normalizedWordHas(state, 'b');
   const bool trackPrev = keyboard.isKeyPressed(',') || wordHas(state, ',');
   const bool trackNext = keyboard.isKeyPressed('/') || wordHas(state, '/');
+  const bool up = keyboard.isKeyPressed('e') || normalizedWordHas(state, 'e');
+  const bool down = keyboard.isKeyPressed('z') || normalizedWordHas(state, 'z');
+  const bool konamiB = keyboard.isKeyPressed('k') || normalizedWordHas(state, 'k');
   const bool options = M5Cardputer.BtnA.isPressed();
   const bool help = keyboard.isKeyPressed('v') || normalizedWordHas(state, 'v') ||
                     hidHas(state, HID_V);
@@ -2143,7 +2356,11 @@ InputState readInput() {
   input.helpPressed = help && !prevHelp;
   input.menuPrevPressed = menuPrev && !prevMenuPrev;
   input.menuNextPressed = menuNext && !prevMenuNext;
+  input.upPressed = up && keyChanged;
+  input.downPressed = down && keyChanged;
+  input.konamiBPressed = konamiB && keyChanged;
   input.typedChar = keyChanged ? firstPrintableNormalized(state) : 0;
+  updateMotionInput(input);
 
   prevLeft = left;
   prevRight = right;
@@ -2578,22 +2795,44 @@ void drawHud() {
   }
 
   canvas.setTextColor(WHITE, fill);
-  canvas.setCursor(9, 5);
-  canvas.printf("SCORE %05lu", static_cast<unsigned long>(score));
-  canvas.setCursor(92, 5);
-  canvas.printf("LV %u", level);
-  canvas.setCursor(132, 5);
-  canvas.printf("LIVES %u", lives);
+  char scoreText[20];
+  char levelText[10];
+  char livesText[12];
+  std::snprintf(scoreText, sizeof(scoreText), "SCORE %05lu",
+                static_cast<unsigned long>(score));
+  std::snprintf(levelText, sizeof(levelText), "LV %u", level);
+  std::snprintf(livesText, sizeof(livesText), "LIVES %u", lives);
 
+  canvas.setCursor(9, 5);
+  canvas.print(scoreText);
+
+  const int levelX = (kScreenW - canvas.textWidth(levelText)) / 2;
+  canvas.setCursor(std::max(0, levelX), 5);
+  canvas.print(levelText);
+
+  const int livesX = kScreenW - 8 - canvas.textWidth(livesText);
+  canvas.setCursor(std::max(0, livesX), 5);
+  canvas.print(livesText);
+
+  const char* statusText = nullptr;
   if (millis() < laserUntilMs) {
-    canvas.setCursor(184, 5);
-    canvas.print("LASER");
+    statusText = "LASER";
   } else if (millis() < slowUntilMs) {
-    canvas.setCursor(188, 5);
-    canvas.print("SLOW");
+    statusText = "SLOW";
   } else if (activeBallCount() > 1) {
-    canvas.setCursor(190, 5);
-    canvas.printf("x%u", static_cast<unsigned>(activeBallCount()));
+    static char multiBallText[8];
+    std::snprintf(multiBallText, sizeof(multiBallText), "x%u",
+                  static_cast<unsigned>(activeBallCount()));
+    statusText = multiBallText;
+  }
+
+  if (statusText != nullptr) {
+    const int statusX = livesX - 8 - canvas.textWidth(statusText);
+    const int scoreRight = 9 + canvas.textWidth(scoreText);
+    if (statusX > scoreRight + 8) {
+      canvas.setCursor(statusX, 5);
+      canvas.print(statusText);
+    }
   }
 }
 
@@ -2630,9 +2869,20 @@ void drawFooterHint(const char* text) {
   drawCenteredText(text, 126, WHITE, rgb565(10, 18, 34));
 }
 
+void renderGyroBadge() {
+  if (!gyroControlsEnabled) {
+    return;
+  }
+  drawSpritePanel(150, 4, 86, 14, rgb565(102, 178, 120), rgb565(26, 82, 40));
+  canvas.setTextColor(WHITE, rgb565(26, 82, 40));
+  canvas.setCursor(158, 8);
+  canvas.print("GYRO ON");
+}
+
 void renderTitleSplash() {
   canvas.fillScreen(BLACK);
   canvas.drawPng(title_png_start, titlePngSize(), 0, 0);
+  renderGyroBadge();
   drawFooterHint("P START   G0 OPTIONS   V HELP");
 }
 
@@ -2654,6 +2904,7 @@ void renderTitleScores() {
   }
 
   drawFooterHint("P START   G0 OPTIONS   V HELP");
+  renderGyroBadge();
 }
 
 void renderTitle() {
@@ -2663,6 +2914,24 @@ void renderTitle() {
   } else {
     renderTitleScores();
   }
+}
+
+void renderKonamiReveal() {
+  const uint32_t elapsed = millis() - stateTimerMs;
+  const bool firstImage = elapsed < kKonamiFirstRevealMs;
+  const uint8_t* start = firstImage ? konami_1_jpg_start : konami_2_jpg_start;
+  const uint8_t* end = firstImage ? konami_1_jpg_end : konami_2_jpg_end;
+
+  canvas.fillScreen(BLACK);
+  canvas.drawJpg(start, binaryAssetSize(start, end), 0, 0);
+}
+
+void renderGyroOff() {
+  canvas.fillScreen(BLACK);
+  canvas.setTextColor(rgb565(255, 120, 120), BLACK);
+  canvas.setTextSize(2);
+  drawCenteredText("GYRO MODE OFF", 58, rgb565(255, 120, 120), BLACK);
+  canvas.setTextSize(1);
 }
 
 void renderOptions() {
@@ -3014,6 +3283,12 @@ void renderFrame() {
     case GameState::GameOver:
       renderGameOver();
       break;
+    case GameState::KonamiReveal:
+      renderKonamiReveal();
+      break;
+    case GameState::GyroOff:
+      renderGyroOff();
+      break;
   }
   canvas.pushSprite(0, 0);
 }
@@ -3060,6 +3335,7 @@ void setup() {
   initFireBackdrop();
   invalidateBackgroundCache();
   refreshBackgroundCache();
+  resetGyroMotionState();
 
   paddle.x = (kScreenW - basePaddleWidth()) * 0.5f;
   paddle.w = basePaddleWidth();
@@ -3109,6 +3385,12 @@ void loop() {
       break;
     case GameState::GameOver:
       updateGameOver(input);
+      break;
+    case GameState::KonamiReveal:
+      updateKonamiReveal();
+      break;
+    case GameState::GyroOff:
+      updateGyroOff();
       break;
   }
 
